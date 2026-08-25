@@ -60,14 +60,6 @@ banking-reconciliation/
     └── banking.db
 ```
 
-## Deploy free on Streamlit Community Cloud
-
-1. Push this repo to GitHub.
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-3. **New app** → select this repo.
-4. Main file path: `app.py`
-5. Deploy → copy the live URL into your portfolio.
-
 The app auto-generates data on first run if `data/banking.db` is missing. Use **Regenerate synthetic data** in the sidebar anytime.
 
 ## Validation rules
