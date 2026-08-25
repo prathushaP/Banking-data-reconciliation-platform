@@ -6,8 +6,7 @@ Detects missing, duplicate, and mismatched banking records using **SQL + Python*
 
 ## Live demo
 
-> After deploy, replace this line with your Streamlit Cloud URL  
-> Example: `https://banking-reconciliation-prathusha.streamlit.app`
+> [Open Live App](https://banking-data-reconciliation-platform-prathusha.streamlit.app/)
 
 ## Features
 
