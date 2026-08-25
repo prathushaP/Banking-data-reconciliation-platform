@@ -48,13 +48,13 @@ def ensure_data(force: bool = False) -> None:
 
 
 @st.cache_data(show_spinner=False)
-def get_results(_version: int = 2):
+def get_results(_version: int = 3):
     ensure_data(force=False)
     return run_reconciliation(DB_PATH)
 
 
 @st.cache_data(show_spinner=False)
-def get_ledgers(_version: int = 2):
+def get_ledgers(_version: int = 3):
     ensure_data(force=False)
     return load_ledgers(DB_PATH)
 
@@ -63,50 +63,212 @@ def money(v: float) -> str:
     return f"${v:,.2f}"
 
 
+def apply_exception_filters(
+    ex: pd.DataFrame,
+    severities: list[str],
+    statuses: list[str],
+    channel: str,
+    region: str,
+) -> pd.DataFrame:
+    if ex.empty:
+        return ex
+    out = ex.copy()
+    if severities and "severity" in out.columns:
+        out = out[out["severity"].isin(severities)]
+    if statuses and "workflow_status" in out.columns:
+        out = out[out["workflow_status"].isin(statuses)]
+    if channel != "All" and "channel" in out.columns:
+        out = out[out["channel"] == channel]
+    if region != "All" and "region" in out.columns:
+        out = out[out["region"] == region]
+    if "priority_score" in out.columns:
+        out = out.sort_values("priority_score", ascending=False)
+    return out
+
+
+def filter_ledger(
+    df: pd.DataFrame,
+    channel: str,
+    region: str,
+    accounts: pd.DataFrame,
+) -> pd.DataFrame:
+    out = df.copy()
+    if channel != "All" and "channel" in out.columns:
+        out = out[out["channel"] == channel]
+    if region != "All":
+        region_accounts = set(accounts.loc[accounts["region"] == region, "account_id"].astype(str))
+        if "account_id" in out.columns:
+            out = out[out["account_id"].astype(str).isin(region_accounts)]
+        elif "region" in out.columns:
+            out = out[out["region"] == region]
+    return out
+
+
 def main() -> None:
     st.sidebar.title("Controls")
     st.sidebar.caption("Prathusha Pasam · Portfolio")
+    st.sidebar.info(
+        "These filters update **Overview, Workbench, Match Quality, and Explore**."
+    )
+
     if st.sidebar.button("Regenerate synthetic data"):
         st.cache_data.clear()
         ensure_data(force=True)
         st.sidebar.success("Data regenerated")
         st.rerun()
 
+    if st.sidebar.button("Reset filters"):
+        for key in ["sev_filter", "status_filter", "channel_filter", "region_filter"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
+
     result = get_results()
     accounts, internal, external = get_ledgers()
 
     severities = st.sidebar.multiselect(
-        "Severity", ["Critical", "High", "Medium", "Low"],
+        "Severity",
+        ["Critical", "High", "Medium", "Low"],
         default=["Critical", "High", "Medium"],
+        key="sev_filter",
     )
     statuses = st.sidebar.multiselect(
-        "Workflow status", ["Open", "Investigating", "Resolved"],
+        "Workflow status",
+        ["Open", "Investigating", "Resolved"],
         default=["Open", "Investigating"],
+        key="status_filter",
     )
     channels = ["All"] + sorted(internal["channel"].dropna().unique().tolist())
-    channel = st.sidebar.selectbox("Channel filter", channels)
+    channel = st.sidebar.selectbox("Channel filter", channels, key="channel_filter")
     regions = ["All"] + sorted(accounts["region"].dropna().unique().tolist())
-    region = st.sidebar.selectbox("Region filter", regions)
+    region = st.sidebar.selectbox("Region filter", regions, key="region_filter")
+
+    # Global filtered datasets driven by sidebar controls
+    ex_all = result.exceptions.copy() if result.exceptions is not None else pd.DataFrame()
+    ex = apply_exception_filters(ex_all, severities, statuses, channel, region)
+
+    internal_f = filter_ledger(internal, channel, region, accounts)
+    external_f = filter_ledger(external, channel, region, accounts)
+    accounts_f = accounts.copy()
+    if region != "All":
+        accounts_f = accounts_f[accounts_f["region"] == region]
+
+    # Filtered summary from exception queue (rule counts under active filters)
+    if ex.empty:
+        summary_f = result.summary.copy()
+        summary_f["issue_count"] = 0
+    else:
+        rule_counts = ex.groupby("rule_id", as_index=False).size().rename(columns={"size": "issue_count"})
+        summary_f = result.summary.drop(columns=["issue_count"]).merge(
+            rule_counts, on="rule_id", how="left"
+        )
+        summary_f["issue_count"] = summary_f["issue_count"].fillna(0).astype(int)
+
+    # Channel / region break charts from filtered exceptions
+    if not ex.empty and "channel" in ex.columns:
+        channel_breaks_f = (
+            ex.dropna(subset=["channel"])
+            .groupby("channel", as_index=False)
+            .agg(issues=("channel", "size"))
+        )
+        if "amount" in ex.columns:
+            channel_breaks_f = channel_breaks_f.merge(
+                ex.groupby("channel", as_index=False)["amount"].sum().rename(columns={"amount": "amount_sum"}),
+                on="channel",
+                how="left",
+            )
+        else:
+            channel_breaks_f["amount_sum"] = 0
+        channel_breaks_f = channel_breaks_f.sort_values("issues", ascending=False)
+    else:
+        channel_breaks_f = pd.DataFrame(columns=["channel", "issues", "amount_sum"])
+
+    if not ex.empty and "region" in ex.columns:
+        region_breaks_f = (
+            ex.dropna(subset=["region"])
+            .groupby("region", as_index=False)
+            .size()
+            .rename(columns={"size": "issues"})
+            .sort_values("issues", ascending=False)
+        )
+    else:
+        region_breaks_f = pd.DataFrame(columns=["region", "issues"])
+
+    # Daily trend from filtered exceptions
+    if not ex.empty and "booking_date" in ex.columns and "rule_id" in ex.columns:
+        rule_name_map = {r["id"]: r["name"] for r in RULES}
+        trend = ex.copy()
+        trend["break_type"] = trend["rule_id"].map(rule_name_map).fillna(trend["rule_id"])
+        daily_trend_f = (
+            trend.groupby(["booking_date", "break_type"], as_index=False)
+            .size()
+            .rename(columns={"booking_date": "break_date", "size": "issues"})
+        )
+    else:
+        daily_trend_f = pd.DataFrame(columns=["break_date", "break_type", "issues"])
+
+    # Account exposure from filtered exceptions
+    if not ex.empty and "account_id" in ex.columns:
+        amt = pd.to_numeric(ex["amount"], errors="coerce") if "amount" in ex.columns else 0
+        abd = pd.to_numeric(ex["abs_diff"], errors="coerce") if "abs_diff" in ex.columns else 0
+        tmp = ex.copy()
+        tmp["_exp"] = pd.Series(amt).fillna(0)
+        if isinstance(abd, pd.Series):
+            tmp["_exp"] = tmp["_exp"].where(tmp["_exp"] > 0, abd.fillna(0))
+        account_exposure_f = (
+            tmp.groupby("account_id", as_index=False)
+            .agg(break_count=("account_id", "size"), exposure_amount=("_exp", "sum"))
+            .sort_values("exposure_amount", ascending=False)
+        )
+        account_exposure_f = account_exposure_f.merge(
+            accounts[["account_id", "customer_name", "region", "product_type", "risk_segment", "branch_id"]],
+            on="account_id",
+            how="left",
+        )
+    else:
+        account_exposure_f = result.account_exposure.iloc[0:0].copy()
+
+    # Match quality filtered by channel/region via ledgers
+    q = result.match_quality.copy()
+    if not q.empty:
+        if channel != "All" and "channel" in q.columns:
+            q = q[q["channel"] == channel]
+        if region != "All" and "account_id" in q.columns:
+            region_accounts = set(accounts.loc[accounts["region"] == region, "account_id"].astype(str))
+            q = q[q["account_id"].astype(str).isin(region_accounts)]
+
+    open_n = int((ex["workflow_status"] == "Open").sum()) if not ex.empty and "workflow_status" in ex.columns else 0
+    inv_n = int((ex["workflow_status"] == "Investigating").sum()) if not ex.empty and "workflow_status" in ex.columns else 0
+    total_issues_f = int(summary_f["issue_count"].sum()) if not summary_f.empty else 0
+    amount_exp_f = float(pd.to_numeric(ex.get("abs_diff", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not ex.empty else 0.0
+    missing_like = ex[ex["rule_id"].isin(["R1", "R2"])] if not ex.empty and "rule_id" in ex.columns else pd.DataFrame()
+    missing_exp_f = float(pd.to_numeric(missing_like.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not missing_like.empty else 0.0
+    avg_score = round(float(q["match_score"].mean()), 1) if not q.empty else 0.0
 
     st.title("🏦 Banking Data Reconciliation Platform")
     st.caption(
         "Built by **Prathusha Pasam** · Core ledger vs settlement feed · SQL validation · Exception workbench"
     )
 
-    k = result.kpis
+    active = (
+        f"**Active filters:** severity={', '.join(severities) or 'None'} · "
+        f"status={', '.join(statuses) or 'None'} · channel={channel} · region={region}"
+    )
+    st.success(active + f" · showing **{len(ex):,}** exception rows")
+
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Accounts", f"{k['accounts']:,}")
-    m2.metric("Internal txns", f"{k['internal_records']:,}")
-    m3.metric("External txns", f"{k['external_records']:,}")
-    m4.metric("Clean matches", f"{k['matched_clean']:,}")
-    m5.metric("Match rate", f"{k['match_rate_pct']}%")
-    m6.metric("Open exceptions", f"{k['open_exceptions']:,}")
+    m1.metric("Accounts (filtered)", f"{len(accounts_f):,}")
+    m2.metric("Internal txns (filtered)", f"{len(internal_f):,}")
+    m3.metric("External txns (filtered)", f"{len(external_f):,}")
+    m4.metric("Clean matches (all)", f"{result.kpis['matched_clean']:,}")
+    m5.metric("Match rate (all)", f"{result.kpis['match_rate_pct']}%")
+    m6.metric("Open exceptions (filtered)", f"{open_n:,}")
 
     e1, e2, e3, e4 = st.columns(4)
-    e1.metric("Total issues", f"{k['total_issues']:,}")
-    e2.metric("Amount exposure", money(k["amount_exposure"]))
-    e3.metric("Missing exposure", money(k["missing_exposure"]))
-    e4.metric("Avg match score", f"{k['avg_match_score']}/100")
+    e1.metric("Filtered issues", f"{total_issues_f:,}")
+    e2.metric("Amount exposure (filtered)", money(amount_exp_f))
+    e3.metric("Missing exposure (filtered)", money(missing_exp_f))
+    e4.metric("Avg match score (filtered)", f"{avg_score}/100")
 
     tab_overview, tab_rules, tab_workbench, tab_quality, tab_explore, tab_about = st.tabs(
         ["Overview", "Validation Rules", "Exception Workbench", "Match Quality", "Explore Data", "About"]
@@ -115,47 +277,59 @@ def main() -> None:
     with tab_overview:
         c1, c2 = st.columns([1.2, 1])
         with c1:
-            st.subheader("Issues by rule")
+            st.subheader("Issues by rule (filtered)")
             fig = px.bar(
-                result.summary, x="rule_name", y="issue_count", color="severity",
+                summary_f, x="rule_name", y="issue_count", color="severity",
                 color_discrete_map=SEV_COLOR, text="issue_count",
             )
             fig.update_layout(xaxis_title="", yaxis_title="Issues", height=390, margin=dict(t=20))
             st.plotly_chart(fig, use_container_width=True)
         with c2:
-            st.subheader("Severity mix")
-            sev = result.summary.groupby("severity", as_index=False)["issue_count"].sum()
-            fig2 = px.pie(
-                sev, names="severity", values="issue_count", hole=0.45,
-                color="severity", color_discrete_map=SEV_COLOR,
-            )
-            fig2.update_layout(height=390, margin=dict(t=20))
-            st.plotly_chart(fig2, use_container_width=True)
+            st.subheader("Severity mix (filtered)")
+            sev = summary_f.groupby("severity", as_index=False)["issue_count"].sum()
+            sev = sev[sev["issue_count"] > 0]
+            if sev.empty:
+                st.info("No issues for current filters.")
+            else:
+                fig2 = px.pie(
+                    sev, names="severity", values="issue_count", hole=0.45,
+                    color="severity", color_discrete_map=SEV_COLOR,
+                )
+                fig2.update_layout(height=390, margin=dict(t=20))
+                st.plotly_chart(fig2, use_container_width=True)
 
         c3, c4 = st.columns(2)
         with c3:
-            st.subheader("Breaks by channel")
-            fig3 = px.bar(result.channel_breaks, x="channel", y="issues", text="issues", color="amount_sum")
-            fig3.update_layout(height=360, margin=dict(t=20))
-            st.plotly_chart(fig3, use_container_width=True)
+            st.subheader("Breaks by channel (filtered)")
+            if channel_breaks_f.empty:
+                st.info("No channel breaks for current filters.")
+            else:
+                fig3 = px.bar(channel_breaks_f, x="channel", y="issues", text="issues", color="amount_sum")
+                fig3.update_layout(height=360, margin=dict(t=20))
+                st.plotly_chart(fig3, use_container_width=True)
         with c4:
-            st.subheader("Breaks by region")
-            fig4 = px.bar(result.region_breaks, x="region", y="issues", text="issues", color="issues")
-            fig4.update_layout(height=360, margin=dict(t=20))
-            st.plotly_chart(fig4, use_container_width=True)
+            st.subheader("Breaks by region (filtered)")
+            if region_breaks_f.empty:
+                st.info("No region breaks for current filters.")
+            else:
+                fig4 = px.bar(region_breaks_f, x="region", y="issues", text="issues", color="issues")
+                fig4.update_layout(height=360, margin=dict(t=20))
+                st.plotly_chart(fig4, use_container_width=True)
 
-        st.subheader("Daily break trend")
-        if not result.daily_trend.empty:
-            trend = result.daily_trend.copy()
-            trend["break_date"] = pd.to_datetime(trend["break_date"])
-            fig5 = px.area(trend, x="break_date", y="issues", color="break_type")
+        st.subheader("Daily break trend (filtered)")
+        if daily_trend_f.empty:
+            st.info("No trend data for current filters.")
+        else:
+            trend_plot = daily_trend_f.copy()
+            trend_plot["break_date"] = pd.to_datetime(trend_plot["break_date"])
+            fig5 = px.area(trend_plot, x="break_date", y="issues", color="break_type")
             fig5.update_layout(height=360, margin=dict(t=20))
             st.plotly_chart(fig5, use_container_width=True)
 
-        st.subheader("Top account exposure")
-        st.dataframe(result.account_exposure.head(20), use_container_width=True, hide_index=True)
-        st.subheader("Rule catalog summary")
-        st.dataframe(result.summary, use_container_width=True, hide_index=True)
+        st.subheader("Top account exposure (filtered)")
+        st.dataframe(account_exposure_f.head(20), use_container_width=True, hide_index=True)
+        st.subheader("Rule catalog summary (filtered)")
+        st.dataframe(summary_f, use_container_width=True, hide_index=True)
 
     with tab_rules:
         labels = {f"{r['id']} · {r['name']} ({r['severity']})": r["id"] for r in RULES}
@@ -163,7 +337,20 @@ def main() -> None:
         rid = labels[choice]
         meta = next(r for r in RULES if r["id"] == rid)
         st.info(f"**{meta['severity']}** — {meta['description']}")
-        df = result.details[rid]
+
+        # Prefer filtered exception rows for this rule when available
+        if not ex.empty and "rule_id" in ex.columns:
+            df = ex[ex["rule_id"] == rid].copy()
+            st.caption("Showing rows after sidebar filters (from exception queue).")
+        else:
+            df = result.details[rid]
+            # still apply channel/region when columns exist
+            if channel != "All" and "channel" in df.columns:
+                df = df[df["channel"] == channel]
+            if region != "All" and "region" in df.columns:
+                df = df[df["region"] == region]
+            st.caption("Showing rule detail view with channel/region filters when available.")
+
         st.write(f"{len(df):,} finding(s)")
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button(
@@ -172,26 +359,19 @@ def main() -> None:
         )
 
     with tab_workbench:
-        st.subheader("Exception queue")
-        ex = result.exceptions.copy()
+        st.subheader("Exception queue (live filtered)")
         if not ex.empty:
-            if severities:
-                ex = ex[ex["severity"].isin(severities)]
-            if statuses:
-                ex = ex[ex["workflow_status"].isin(statuses)]
-            if channel != "All" and "channel" in ex.columns:
-                ex = ex[ex["channel"] == channel]
-            if region != "All" and "region" in ex.columns:
-                ex = ex[ex["region"] == region]
-            ex = ex.sort_values("priority_score", ascending=False)
-
             k1, k2, k3 = st.columns(3)
             k1.metric("Queued rows", f"{len(ex):,}")
-            k2.metric("Open", f"{int((ex['workflow_status']=='Open').sum()):,}")
-            k3.metric("Investigating", f"{int((ex['workflow_status']=='Investigating').sum()):,}")
+            k2.metric("Open", f"{open_n:,}")
+            k3.metric("Investigating", f"{inv_n:,}")
 
-            wc = ex.groupby("workflow_status", as_index=False).size()
-            st.plotly_chart(px.pie(wc, names="workflow_status", values="size", hole=0.4), use_container_width=True)
+            if "workflow_status" in ex.columns:
+                wc = ex.groupby("workflow_status", as_index=False).size()
+                st.plotly_chart(
+                    px.pie(wc, names="workflow_status", values="size", hole=0.4),
+                    use_container_width=True,
+                )
 
             show_cols = [
                 c for c in [
@@ -206,13 +386,12 @@ def main() -> None:
                 file_name="exception_queue.csv", mime="text/csv",
             )
         else:
-            st.success("No exceptions found.")
+            st.warning("No exceptions match the current sidebar controls. Try Reset filters.")
 
     with tab_quality:
-        st.subheader("Pairwise match quality (overlapping txn_ids)")
-        q = result.match_quality
+        st.subheader("Pairwise match quality (filtered by channel/region)")
         if q.empty:
-            st.warning("No overlapping transactions.")
+            st.warning("No overlapping transactions for current filters.")
         else:
             band = q.groupby("match_band", as_index=False, observed=False).size()
             b1, b2 = st.columns(2)
@@ -236,18 +415,20 @@ def main() -> None:
     with tab_explore:
         src = st.radio("Dataset", ["Internal ledger", "External ledger", "Accounts"], horizontal=True)
         if src == "Accounts":
-            df = accounts.copy()
+            df = accounts_f.copy()
         elif src == "Internal ledger":
-            df = internal.copy()
+            df = internal_f.copy()
         else:
-            df = external.copy()
+            df = external_f.copy()
+
+        st.caption("Starts from sidebar channel/region filters, then local filters below.")
 
         f1, f2, f3, f4 = st.columns(4)
         if "account_id" in df.columns:
             accs = ["All"] + sorted(df["account_id"].astype(str).unique().tolist())
             acc = f1.selectbox("Account", accs, key="ex_acc")
             if acc != "All":
-                df = df[df["account_id"] == acc]
+                df = df[df["account_id"].astype(str) == acc]
         if "channel" in df.columns:
             chs = ["All"] + sorted(df["channel"].dropna().unique().tolist())
             ch = f2.selectbox("Channel", chs, key="ex_ch")
@@ -272,7 +453,7 @@ def main() -> None:
         st.write(f"{len(df):,} rows")
         st.dataframe(df.head(1000), use_container_width=True, hide_index=True)
 
-        if {"booking_date", "amount"}.issubset(df.columns):
+        if {"booking_date", "amount"}.issubset(df.columns) and not df.empty:
             daily = (
                 df.assign(booking_date=pd.to_datetime(df["booking_date"]))
                 .groupby("booking_date", as_index=False)["amount"].sum()
@@ -303,23 +484,9 @@ def main() -> None:
             Portfolio platform that reconciles a **core banking ledger** against an
             **external settlement feed** using SQL validation rules and Python analytics.
 
-            ### Data design
-            Synthetic data modeled after public banking dataset patterns
-            (PKDD'99-style accounts + Kaggle-style transaction fields):
-            accounts, branches/regions, products, booking/value dates, fees,
-            merchants, categories, channels, and lifecycle statuses.
-
-            ### Detection coverage
-            - Missing on either side
-            - Amount / fee / date / status mismatches
-            - Duplicate business keys
-            - High-value breaks
-            - Account-level exposure
-            - Match quality scoring (0–100)
-            - Exception workflow queue (Open / Investigating / Resolved)
-
-            ### Tech stack
-            Python · pandas · SQLite · Streamlit · Plotly
+            ### Controls
+            Sidebar filters are **global**. They update Overview KPIs/charts, Exception
+            Workbench, Validation Rules, Match Quality, and Explore Data.
 
             ### Author
             **Prathusha Pasam**
